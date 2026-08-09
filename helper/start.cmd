@@ -1,6 +1,9 @@
 @echo off
-rem Start the DJ Crate helper. Leave this window open while downloading.
+rem Double-click launcher. Real work happens in start.ps1: it installs any
+rem missing prerequisites, fetches yt-dlp/ffmpeg, then runs the server.
+rem Leave this window open while downloading.
 cd /d "%~dp0"
-rem -u so progress and status lines appear immediately rather than buffering.
-python -u server.py
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" %*
+echo.
+echo Helper stopped.
 pause

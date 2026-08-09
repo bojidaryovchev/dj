@@ -17,53 +17,48 @@ origin check pinned to one extension ID.
 
 ## Install
 
-### 1. Get the tools
+### 1. Start the helper
 
-Only **Python 3** and a **JavaScript runtime** have to be on the machine
-already. Everything else the bootstrap fetches:
+Double-click **`helper\start.cmd`**. That's the whole install step — it takes
+the machine from nothing to running:
 
-```powershell
-cd d:\repos\dj\helper
-python bootstrap.py
-```
+| | |
+|---|---|
+| Python missing? | installs it via `winget` |
+| No Node or Deno? | installs Node LTS via `winget` |
+| No `config.json`? | creates one and prints a fresh token |
+| No `yt-dlp` / `ffmpeg`? | runs `bootstrap.py` to fetch them into `bin/` |
+| all present | falls straight through and starts the server |
 
-That pulls `yt-dlp.exe` and `ffmpeg.exe` / `ffprobe.exe` into `helper/bin/`
-(~310 MB, one time). The helper prefers `bin/` over anything on PATH, so this
-works on a machine with neither installed — and it pins you to yt-dlp's own
-patched ffmpeg build rather than whatever old copy is first on PATH.
+Every step is idempotent, so it's safe to run every time — on a normal day it
+goes straight to the server. Pass `-Yes` to install prerequisites without
+prompting.
 
-Re-run with `--force` to update both later:
+Leave the window open while you download.
+
+Prefer to do it by hand? `python bootstrap.py` then `python server.py`.
+
+**What gets fetched.** `yt-dlp.exe`, `ffmpeg.exe` and `ffprobe.exe` land in
+`helper/bin/` (~310 MB, one time). The helper prefers `bin/` over anything on
+PATH, which pins you to yt-dlp's own patched ffmpeg build instead of whatever
+old copy happens to be first on PATH. Update both later with:
 
 ```powershell
 python bootstrap.py --force
 ```
 
-**About the JavaScript runtime.** YouTube gates playback behind JS challenges
-yt-dlp has to execute. Without a runtime you get
+**Why a JavaScript runtime.** YouTube gates playback behind JS challenges
+yt-dlp has to execute. Without one you get
 `WARNING: No supported JavaScript runtime could be found` and **some formats
-silently go missing** — a worse rip with no error to tell you.
+silently go missing** — a worse rip with no error to tell you. Deno is
+yt-dlp's default, but Node works too and `config.json` passes
+`--js-runtimes node` for that reason. Supported: Deno, Node, QuickJS. Bun is
+deprecated.
 
-Deno is yt-dlp's default, but **Node also works and you already have v24**, so
-there's nothing to install here. `config.json` passes `--js-runtimes node` for
-that reason. Supported: Deno, Node, QuickJS. Bun is deprecated.
+> `winget` ships with Windows 11. Chocolatey would need admin rights *and*
+> installing Chocolatey itself first, so it isn't used here.
 
-If you ever move this to a machine with neither, install one:
-
-```powershell
-irm https://deno.land/install.ps1 | iex     # or just install Node
-```
-
-### 2. Start the helper
-
-```powershell
-cd d:\repos\dj\helper
-python server.py
-```
-
-Or double-click `helper\start.cmd`. It prints its config and flags anything
-missing. Leave it running while you download.
-
-### 3. Load the extension
+### 2. Load the extension
 
 1. `chrome://extensions` → enable **Developer mode**
 2. **Load unpacked** → select `d:\repos\dj\extension`
@@ -73,10 +68,11 @@ The ID is pinned by the `key` field in the manifest. Don't remove it — the
 helper's origin check is tied to it, and without it Chrome reassigns the ID on
 every reload.
 
-### 4. Pair them
+### 3. Pair them
 
-Open the extension's **options** page and paste the `token` from
-`helper/config.json`. Set your destination folder. Save.
+Open the extension's **options** page and paste the `token` — `start.cmd`
+prints it the first time it creates `config.json`, and it's in that file
+after. Set your destination folder. Save.
 
 ---
 
@@ -160,8 +156,9 @@ extension/
   lib.js            tab classification, API client, cookie export
 helper/
   server.py         job queue + yt-dlp pool
+  start.cmd         double-click launcher (thin wrapper)
+  start.ps1         installs prerequisites, then runs the server
   bootstrap.py      fetches yt-dlp + ffmpeg into bin/
-  start.cmd         double-click launcher
   config.json       token, destination, concurrency   (secret — keep local)
   bin/              yt-dlp.exe, ffmpeg.exe, ffprobe.exe  (not committed)
   cookies/          exported jars                     (secret — keep local)
