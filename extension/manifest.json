@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "DJ Crate",
+  "version": "1.0.0",
+  "description": "Collect open YouTube and SoundCloud tabs and download them as a batch via a local yt-dlp helper.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx/ytXsnvsREgAQjwCYOG8oALtM9wSuTS0i4yLAlB04tZgPXBZ5Vo5YwSiHGIpnlSc+YKtgLHWYqBr5rSKPCzqLTilcZBl7VT9MjN9zJ9ZGQgZZd8aoPMMH94EgY7Nyj6EMkPsbDahlk+XoSKlXils+Pia3i+NJxs/LvNyzS2V2iqN3xUvtST78fb7kGdJLSkpZxKDnNseN55+aToe2oy7/LWM6aLpQjsYdQo+mZ+0T8mBuCWw8DxpIkxeW3j9mRTEw4PweJ03VQlgtzPe57mV1MUScchNrKEBMd825+ACBz8pS3KVLbc2Kx8gxendWoPXq8FSRHGpsxzd7hvFr0ldwIDAQAB",
+  "permissions": [
+    "tabs",
+    "cookies",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://*.youtube.com/*",
+    "https://*.youtu.be/*",
+    "https://*.soundcloud.com/*"
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "DJ Crate",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options.html"
+}

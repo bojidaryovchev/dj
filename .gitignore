@@ -1,0 +1,9 @@
+# Downloaded binaries — fetch with: python helper/bootstrap.py
+helper/bin/
+
+# Secrets and local state — never commit these.
+helper/config.json
+helper/cookies/
+helper/archive.txt
+helper/extension_private_key.pem
+*.log

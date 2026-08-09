@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon32.png" alt="" class="logo">
+    <div class="title">DJ Crate</div>
+    <div id="status" class="status">checking helper…</div>
+  </header>
+
+  <div class="bar">
+    <label class="check"><input type="checkbox" id="toggleAll" checked> <span id="count">0 tabs</span></label>
+    <div class="spacer"></div>
+    <button id="refresh" class="ghost" title="Rescan open tabs">Rescan</button>
+    <button id="cookies" class="ghost" title="Export browser cookies to the helper">Sync cookies</button>
+  </div>
+
+  <ul id="list" class="list"></ul>
+
+  <div id="empty" class="empty hidden">
+    No YouTube or SoundCloud tabs open.
+  </div>
+
+  <footer>
+    <div id="dest" class="dest"></div>
+    <button id="download" class="primary">Download selected</button>
+  </footer>
+</body>
+<script type="module" src="popup.js"></script>
+</html>
