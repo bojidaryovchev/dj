@@ -14,6 +14,7 @@ const el = {
 
 let items = [];   // classified tabs
 let poll = null;
+let pollFails = 0;
 
 // --- helper connection ---------------------------------------------------
 
@@ -51,6 +52,30 @@ async function scanTabs() {
   const tabs = await chrome.tabs.query({});
   items = dedupe(tabs.map(classifyTab).filter(Boolean));
   render();
+  await markHeld();
+}
+
+/**
+ * Untick anything the helper still has on disk, so you can see what's
+ * genuinely new before queueing rather than after.
+ */
+async function markHeld() {
+  let have;
+  try {
+    ({ have } = await api("/library"));
+  } catch {
+    return;   // not paired yet, or helper down -- leave everything ticked
+  }
+
+  for (const row of rows()) {
+    const name = have[row.dataset.url];
+    if (!name) continue;
+    row.querySelector("input").checked = false;
+    const state = row.querySelector(".state");
+    state.className = "state skipped";
+    state.textContent = `↷ already have ${name}`;
+  }
+  updateCount();
 }
 
 function render() {
@@ -165,16 +190,30 @@ async function startDownload() {
 }
 
 function startPolling() {
-  if (poll) clearInterval(poll);
+  stopPolling();
+  pollFails = 0;
   poll = setInterval(refreshJobs, 700);
   refreshJobs();
+}
+
+function stopPolling() {
+  if (poll) clearInterval(poll);
+  poll = null;
 }
 
 async function refreshJobs() {
   let jobs;
   try {
     ({ jobs } = await api("/jobs"));
-  } catch {
+    pollFails = 0;
+  } catch (e) {
+    // Give up rather than retrying a rejection twice a second forever — that
+    // buries the actual cause under hundreds of identical log lines.
+    if (++pollFails >= 3) {
+      stopPolling();
+      setStatus(`progress unavailable: ${e.message}`, "bad");
+      el.download.disabled = selected().length === 0;
+    }
     return;
   }
 
@@ -204,15 +243,14 @@ async function refreshJobs() {
     } else {
       state.className = `state ${job.status}`;
       state.textContent = job.status === "done" ? `✓ ${job.message}`
-                        : job.status === "skipped" ? "already have it"
+                        : job.status === "skipped" ? `↷ ${job.message}`
                         : `✕ ${job.message}`;
       bar.style.width = job.status === "done" ? "100%" : "0";
     }
   }
 
   if (active === 0) {
-    clearInterval(poll);
-    poll = null;
+    stopPolling();
     el.download.disabled = selected().length === 0;
   }
 }

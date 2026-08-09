@@ -11,6 +11,7 @@ Stdlib only -- no pip install required.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import queue
@@ -27,12 +28,33 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 COOKIE_DIR = HERE / "cookies"
-ARCHIVE_PATH = HERE / "archive.txt"
+LIBRARY_PATH = HERE / "library.json"
 BIN = HERE / "bin"                      # populated by bootstrap.py
 
 # yt-dlp emits one of these per progress tick; see --progress-template below.
 PROGRESS_RE = re.compile(r"^PROG\|([^|]*)\|([^|]*)\|(.*)$")
 PERCENT_RE = re.compile(r"([\d.]+)")
+
+# ...and one of these per post-processing stage. We ask for these explicitly
+# because --print implies --quiet, which silences yt-dlp's ordinary
+# "[ExtractAudio] Destination: ..." chatter -- leaving the bar parked at 100%
+# for the whole transcode, which on an hour-long set looks like a hang.
+PP_RE = re.compile(r"^PP\|([^|]*)\|(.*)$")
+
+PP_LABELS = {
+    "MetadataParser": "reading tags",
+    "ExtractAudio": "converting",
+    "Metadata": "tagging",
+    "EmbedThumbnail": "artwork",
+    "ThumbnailsConvertor": "artwork",
+    "MoveFiles": "filing",
+}
+
+
+def pp_label(name: str) -> str:
+    if name.startswith("Fixup"):
+        return "remuxing"
+    return PP_LABELS.get(name, "processing")
 
 
 def resolve_tool(name: str, configured: str | None = None) -> str:
@@ -61,6 +83,47 @@ def save_config(cfg: dict) -> None:
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
     tmp.replace(CONFIG_PATH)
+
+
+# -- library ---------------------------------------------------------------
+#
+# What we've actually got, url -> where it landed. This replaces yt-dlp's
+# --download-archive, which records only "youtube <id>" and so can never
+# notice that you moved, renamed or deleted the file: it just keeps claiming
+# you have a track that isn't on disk any more. Storing the path lets every
+# skip be re-checked against the filesystem.
+
+LIBRARY_LOCK = threading.Lock()
+
+
+def load_library() -> dict:
+    try:
+        with LIBRARY_PATH.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def have_file(url: str, library: dict | None = None) -> str:
+    """The file we hold for this URL, or "" if it's gone or we never had it."""
+    rec = (load_library() if library is None else library).get(url)
+    path = (rec or {}).get("path", "")
+    return path if path and os.path.exists(path) else ""
+
+
+def record_download(job: "Job") -> None:
+    with LIBRARY_LOCK:
+        library = load_library()
+        library[job.url] = {
+            "path": job.filepath,
+            "title": job.title,
+            "bytes": os.path.getsize(job.filepath) if os.path.exists(job.filepath) else 0,
+            "at": time.time(),
+        }
+        tmp = LIBRARY_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(library, fh, indent=2, ensure_ascii=False)
+        tmp.replace(LIBRARY_PATH)
 
 
 class Job:
@@ -140,6 +203,8 @@ def build_command(job: Job, cfg: dict) -> list[str]:
         "--print", "after_move:filepath",
         "--progress-template",
         "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+        "--progress-template",
+        "postprocess:PP|%(progress.status)s|%(progress.postprocessor)s",
         # Prefer a container we can remux rather than re-encode where possible.
         "-f", "bestaudio[ext=m4a]/bestaudio/best",
         "-x",
@@ -154,15 +219,15 @@ def build_command(job: Job, cfg: dict) -> list[str]:
                            "%(artist,uploader)s - %(track,title)s.%(ext)s"),
         "--retries", "3",
         "--fragment-retries", "10",
+        # Second line of defence behind the library check: if a track resolves
+        # to a name we already hold, leave the existing file alone.
+        "--no-overwrites",
     ]
 
     # Point yt-dlp at our bundled ffmpeg when we have one, so the transcode
     # doesn't fall back to an unknown system build.
     if (BIN / "ffmpeg.exe").exists():
         cmd += ["--ffmpeg-location", str(BIN)]
-
-    if cfg.get("use_archive", True):
-        cmd += ["--download-archive", str(ARCHIVE_PATH)]
 
     if cfg.get("use_cookies", True):
         jar = cookie_file_for(job.url)
@@ -178,6 +243,16 @@ def build_command(job: Job, cfg: dict) -> list[str]:
 
 
 def run_job(job: Job, cfg: dict) -> None:
+    # Settle this against the filesystem before touching the network: if the
+    # file we recorded is still sitting there, there is nothing to do.
+    if cfg.get("use_archive", True):
+        held = have_file(job.url)
+        if held:
+            job.status = "skipped"
+            job.filepath = held
+            job.message = f"already have {os.path.basename(held)}"
+            return
+
     job.status = "running"
     cmd = build_command(job, cfg)
 
@@ -202,7 +277,6 @@ def run_job(job: Job, cfg: dict) -> None:
         return
 
     tail: list[str] = []
-    already_downloaded = False
 
     for line in proc.stdout:
         line = line.rstrip("\n")
@@ -219,15 +293,16 @@ def run_job(job: Job, cfg: dict) -> None:
             job.eta = eta.strip()
             continue
 
-        if "has already been recorded in the archive" in line:
-            already_downloaded = True
-
-        # Post-processing runs after the bar hits 100%; say so rather than
-        # sitting at "100%" for the length of an ffmpeg transcode.
-        if line.startswith("[ExtractAudio]"):
-            job.message = "converting"
-        elif line.startswith(("[Metadata]", "[EmbedThumbnail]", "[ThumbnailsConvertor]")):
-            job.message = "tagging"
+        # Name the ffmpeg stage that's running, so the wait after the bar
+        # fills reads as work rather than as a stall.
+        m = PP_RE.match(line)
+        if m:
+            status, name = m.groups()
+            if status == "started":
+                job.percent = 100.0
+                job.speed = job.eta = ""
+                job.message = pp_label(name)
+            continue
 
         # --print after_move:filepath writes the final path on its own line.
         if os.path.isabs(line) and Path(line).parent.exists():
@@ -239,13 +314,19 @@ def run_job(job: Job, cfg: dict) -> None:
 
     code = proc.wait()
 
-    if code == 0 and already_downloaded and not job.filepath:
+    # A real download always announces its destination via --print
+    # after_move:filepath, so a clean exit with nothing printed means yt-dlp
+    # skipped the track -- practically always the download archive. Don't try
+    # to read its "already recorded" notice instead: --print implies --quiet,
+    # which swallows that line, and --progress only restores the progress bar.
+    if code == 0 and not job.filepath:
         job.status = "skipped"
-        job.message = "Already in archive"
+        job.message = "file already on disk — nothing downloaded"
     elif code == 0:
         job.status = "done"
         job.percent = 100.0
-        job.message = os.path.basename(job.filepath) if job.filepath else "Done"
+        job.message = os.path.basename(job.filepath)
+        record_download(job)
     else:
         job.status = "error"
         errs = [t for t in tail if "ERROR" in t or "Unsupported" in t]
@@ -275,7 +356,19 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("  %s\n" % (fmt % args))
 
     def _origin_ok(self) -> bool:
-        origin = self.headers.get("Origin", "")
+        """
+        Reject callers from another origin.
+
+        A missing Origin is normal, not suspicious: our host_permissions entry
+        makes Chrome skip CORS for these requests, and without cors mode it
+        only attaches Origin when the method isn't GET/HEAD -- so every
+        GET /jobs arrives without one. Nothing that can omit the header can
+        also set X-Auth-Token (that forces cors mode, which forces Origin),
+        so the token check below is what gates those.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
         allowed = load_config().get("extension_id", "")
         return origin == f"chrome-extension://{allowed}"
 
@@ -295,11 +388,29 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _drain(self) -> None:
+        """
+        Consume a request body we're about to reject unread.
+
+        We speak HTTP/1.1, so the connection is reused. Bytes left in the
+        socket get parsed as the next request line -- a 401 on /jobs would
+        otherwise turn the following /cookies POST into a bogus 400.
+        """
+        remaining = int(self.headers.get("Content-Length") or 0)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _authed(self) -> bool:
         if not self._origin_ok():
+            self._drain()
             self._send(403, {"error": "origin not allowed"})
             return False
-        if self.headers.get("X-Auth-Token") != load_config().get("token"):
+        if not hmac.compare_digest(self.headers.get("X-Auth-Token") or "",
+                                   load_config().get("token") or ""):
+            self._drain()
             self._send(401, {"error": "bad token"})
             return False
         return True
@@ -340,6 +451,19 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authed():
                 return
             self._send(200, {"jobs": STORE.snapshot()})
+            return
+
+        if self.path == "/library":
+            if not self._authed():
+                return
+            # Verified against disk on every call, so a track you deleted
+            # stops being reported as held and becomes downloadable again.
+            library = load_library()
+            self._send(200, {"have": {
+                url: os.path.basename(rec["path"])
+                for url, rec in library.items()
+                if have_file(url, library)
+            }})
             return
 
         self._send(404, {"error": "not found"})

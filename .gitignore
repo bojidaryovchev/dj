@@ -5,5 +5,8 @@ helper/bin/
 helper/config.json
 helper/cookies/
 helper/archive.txt
+helper/library.json
 helper/extension_private_key.pem
+__pycache__/
 *.log
+crate/

@@ -138,8 +138,15 @@ artwork and `Artist - Title` split into proper ID3 fields. Rekordbox, Serato
 and Traktor all read this; none of them read the Opus/WebM that YouTube
 actually serves, which is why the transcode is there.
 
-`helper/archive.txt` records what you've pulled, so re-scanning your tabs won't
-re-download. Delete it to start fresh.
+`helper/library.json` records where each download landed, so re-scanning your
+tabs won't re-download. Rows you already hold come back **unticked** with the
+filename, before you queue anything.
+
+The check is against the filesystem, not a list of ids: delete or move a track
+and it becomes downloadable again on the next scan. That's why this replaced
+yt-dlp's `--download-archive`, which stores only `youtube <id>` and so goes on
+insisting you have files you deleted months ago. Delete `library.json` to start
+fresh. (`archive.txt` is left over from that scheme and is no longer read.)
 
 ---
 
@@ -158,7 +165,7 @@ helper/
   config.json       token, destination, concurrency   (secret — keep local)
   bin/              yt-dlp.exe, ffmpeg.exe, ffprobe.exe  (not committed)
   cookies/          exported jars                     (secret — keep local)
-  archive.txt       already-downloaded track ids
+  library.json      url -> where the file landed
 ```
 
 Tool resolution order is `bin/` → `ytdlp_path` in config → PATH.
