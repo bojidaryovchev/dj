@@ -1,12 +1,30 @@
-# Downloaded binaries — fetch with: python helper/bootstrap.py
-helper/bin/
+# --- crate-helper -------------------------------------------------------
+# Downloaded binaries — fetch with: python packages/crate-helper/bootstrap.py
+packages/crate-helper/bin/
 
 # Secrets and local state — never commit these.
-helper/config.json
-helper/cookies/
-helper/archive.txt
-helper/library.json
-helper/extension_private_key.pem
+packages/crate-helper/config.json
+packages/crate-helper/cookies/
+packages/crate-helper/archive.txt
+packages/crate-helper/library.json
+packages/crate-helper/extension_private_key.pem
+
+# --- track-intelligence -------------------------------------------------
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+htmlcov/
+.coverage
+
+# Real-music validation datasets are personal libraries, not repo content.
+packages/track-intelligence/fixtures/real/
+
+# --- general ------------------------------------------------------------
 __pycache__/
 *.log
 crate/
+.env

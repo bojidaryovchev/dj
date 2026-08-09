@@ -1,0 +1,30 @@
+# docker compose up --build
+#
+# One service. There is no database, no queue and no cache here on purpose:
+# analysis is a pure function of a file, and nothing in the first version
+# needs to remember anything between requests.
+
+services:
+  api:
+    build: .
+    image: dj-track-intelligence
+    ports:
+      - "8000:8000"
+    environment:
+      DJTI_KEY_ENGINE: essentia
+      DJTI_TEMPO_ENGINE: essentia
+      DJTI_KEY_PROFILE: edma
+      DJTI_LOG_FORMAT: json
+      DJTI_LOG_LEVEL: INFO
+      DJTI_MAX_UPLOAD_BYTES: "268435456"
+    volumes:
+      # Point this at a crate to analyse files by path from inside the
+      # container: docker compose exec api dj-analyze /music/track.mp3
+      - ./fixtures:/music:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped

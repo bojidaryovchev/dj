@@ -1,0 +1,20 @@
+# Example validation dataset for scripts/evaluate_dataset.py.
+#
+# Copy this next to your own audio and fill it in. Paths are resolved
+# relative to this file, so a dataset can sit in the folder it describes.
+#
+# 'file' is required. Everything else is optional -- a row with only a BPM
+# label contributes to the tempo metrics and is skipped for key metrics.
+# Give either expected_camelot or expected_key + expected_mode; if you give
+# both, they are cross-checked and a disagreement stops the run.
+#
+# Enharmonic spellings are normalised: Ab and G# are the same label.
+#
+# Real music only. Synthetic fixtures are already covered by the test suite
+# and tell you nothing about accuracy on records.
+file,expected_key,expected_mode,expected_camelot,expected_bpm
+example-track-1.mp3,F,minor,4A,126
+example-track-2.mp3,A,minor,8A,128
+example-track-3.flac,Ab,major,4B,124
+example-track-4.wav,C,major,,120
+example-track-5.m4a,,,11A,174
