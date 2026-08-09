@@ -8,6 +8,7 @@ what this layer *is*, and calling the handlers directly would skip all three.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -270,3 +271,101 @@ def test_openapi_is_served(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert "/v1/tracks/analyze" in schema["paths"]
     assert "/v1/dj/compatibility" in schema["paths"]
+
+
+# -- rhythm in the analysis response ----------------------------------------
+
+
+@pytest.mark.integration
+def test_analysis_includes_the_rhythmic_grid(client: TestClient, f_minor_wav: Path) -> None:
+    with f_minor_wav.open("rb") as handle:
+        response = client.post("/v1/tracks/analyze", files={"file": ("f.wav", handle, "audio/wav")})
+    body = response.json()
+
+    assert body["rhythm"]["meter"]["beats_per_bar"] == 4
+    assert body["rhythm"]["grid"]["bar_count"] > 0
+    assert body["rhythm"]["beats"], "the indexed beat list should be populated"
+    assert body["downbeats"], "downbeats are no longer permanently null"
+    assert body["rhythm"]["drift"]["classification"] in {
+        "stable",
+        "minor_drift",
+        "variable_tempo",
+        "highly_variable",
+    }
+    # The default profile plans no warp.
+    assert body["warp"] is None
+
+
+@pytest.mark.integration
+def test_excluding_beats_drops_both_views(client: TestClient, f_minor_wav: Path) -> None:
+    with f_minor_wav.open("rb") as handle:
+        response = client.post(
+            "/v1/tracks/analyze",
+            files={"file": ("f.wav", handle, "audio/wav")},
+            data={"include_beats": "false"},
+        )
+    body = response.json()
+    assert body["beats"] == []
+    assert body["rhythm"]["beats"] == []
+    assert body["rhythm"]["grid"]["bar_count"] > 0  # the summary survives
+
+
+@pytest.mark.integration
+def test_the_basic_profile_skips_rhythm_over_http(client: TestClient, f_minor_wav: Path) -> None:
+    with f_minor_wav.open("rb") as handle:
+        response = client.post(
+            "/v1/tracks/analyze",
+            files={"file": ("f.wav", handle, "audio/wav")},
+            data={"profile": "basic"},
+        )
+    body = response.json()
+    assert body["tempo"]["bpm"] is not None
+    assert body["rhythm"]["beats"] == []
+    assert body["structure"]["boundaries"] == []
+
+
+# -- warp endpoints ---------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_warp_plan_reports_a_recommendation(client: TestClient, f_minor_wav: Path) -> None:
+    with f_minor_wav.open("rb") as handle:
+        response = client.post(
+            "/v1/tracks/warp/plan", files={"file": ("f.wav", handle, "audio/wav")}
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["warp"]["recommendation"]["reason"]
+    assert body["warp"]["metrics"]["marker_count"] >= 2
+    assert body["rhythm"]["grid"]["bar_count"] > 0
+
+
+@pytest.mark.integration
+def test_warp_render_refuses_a_track_that_does_not_need_it(
+    client: TestClient, f_minor_wav: Path
+) -> None:
+    """409 rather than quietly stretching audio that was already fine."""
+    with f_minor_wav.open("rb") as handle:
+        response = client.post(
+            "/v1/tracks/warp/render", files={"file": ("f.wav", handle, "audio/wav")}
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "warp_not_recommended"
+
+
+@pytest.mark.integration
+def test_warp_render_returns_audio(client: TestClient, drifting_wav: Path) -> None:
+    with drifting_wav.open("rb") as handle:
+        response = client.post(
+            "/v1/tracks/warp/render",
+            files={"file": ("drifting.wav", handle, "audio/wav")},
+            data={"target_bpm": "126"},
+        )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert len(response.content) > 10_000
+
+    verification = json.loads(response.headers["X-Warp-Verification"])
+    assert verification["passed"] is True
+    assert verification["mean_grid_error_ms"] < verification["source_mean_grid_error_ms"]
+    assert int(response.headers["X-Warp-Markers"]) >= 2

@@ -30,6 +30,7 @@ __all__ = [
     "bpm_from_beats",
     "consistency_confidence",
     "interval_stats",
+    "musical_beat_indices",
     "tempo_candidates",
 ]
 
@@ -77,6 +78,33 @@ def interval_stats(beats: list[float] | np.ndarray) -> tuple[float | None, float
     return median, float(np.std(inliers) / mean)
 
 
+def musical_beat_indices(times: np.ndarray, median_interval: float | None = None) -> np.ndarray:
+    """
+    Which musical beat each detected beat is, as a zero-based index.
+
+    Ordinal position is not musical position. If the tracker drops a beat,
+    the next detection is still musical beat 5, and numbering it 4 shifts
+    every bar line after it by one — which is exactly how a grid ends up a
+    beat out halfway through a track.
+
+    Indices accumulate from each interval in turn rather than from each
+    beat's absolute position. Position-based indexing looks simpler and is
+    wrong: the median it divides by is itself frame-quantised, so a 1% bias
+    compounds until, a minute in, beats land on the wrong index entirely.
+    Per-interval rounding only needs each single interval to land nearest its
+    own beat count, which survives both the bias and a dropped beat (an
+    interval spanning two beats rounds to 2).
+    """
+    if median_interval is None:
+        median_interval, _ = interval_stats(times)
+    if median_interval is None or median_interval <= 0:
+        return np.arange(times.size, dtype=np.float64)
+
+    steps = np.round(np.diff(times) / median_interval)
+    steps = np.where(steps < 1, 1, steps)
+    return np.concatenate([[0.0], np.cumsum(steps)])
+
+
 def bpm_from_beats(beats: list[float] | np.ndarray) -> float | None:
     """
     BPM implied by the detected beat grid, fitted across the whole track.
@@ -102,17 +130,7 @@ def bpm_from_beats(beats: list[float] | np.ndarray) -> float | None:
     if median_interval is None:
         return None
 
-    # Indices accumulate from each interval in turn, rather than from each
-    # beat's absolute position. Position-based indexing looks simpler and is
-    # wrong: the median it divides by is itself quantised, so a 1% bias
-    # compounds until, a minute in, beats are assigned to the wrong index
-    # entirely and the fit is dragged further off than the median it was
-    # meant to improve on. Per-interval rounding only needs each single
-    # interval to land nearest its own beat count, which survives both the
-    # bias and a dropped beat (an interval of two beats rounds to 2).
-    steps = np.round(np.diff(times) / median_interval)
-    steps = np.where(steps < 1, 1, steps)
-    indices = np.concatenate([[0.0], np.cumsum(steps)])
+    indices = musical_beat_indices(times, median_interval)
 
     spread = float(indices[-1])
     if spread <= 0:

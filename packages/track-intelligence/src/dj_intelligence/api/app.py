@@ -33,7 +33,7 @@ from ..errors import (
 )
 from ..observability import configure_logging, get_logger, new_request_id, request_id_var
 from ..version import ANALYSIS_VERSION
-from .routes import dj, health, tracks
+from .routes import dj, health, tracks, warp
 
 log = get_logger(__name__)
 
@@ -140,4 +140,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(tracks.router)
     app.include_router(dj.router)
+    app.include_router(warp.router)
     return app

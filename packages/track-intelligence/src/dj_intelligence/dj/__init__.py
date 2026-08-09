@@ -11,12 +11,15 @@ one way only, which is what keeps "what is in the signal" separable from
 
 from .compatibility import RULES_VERSION, ScoringRules, score_pair
 from .interpret import camelot_for, interpret, preferred_mix_bpm
+from .warp_advice import WarpAdviceRules, recommend_warp
 
 __all__ = [
     "RULES_VERSION",
     "ScoringRules",
+    "WarpAdviceRules",
     "camelot_for",
     "interpret",
     "preferred_mix_bpm",
+    "recommend_warp",
     "score_pair",
 ]

@@ -14,9 +14,9 @@ material.
 
 The CSV needs a ``file`` column and at least one label column:
 
-    file,expected_key,expected_mode,expected_camelot,expected_bpm
-    track1.mp3,F,minor,4A,126
-    track2.mp3,A,minor,8A,128
+    file,expected_key,expected_mode,expected_camelot,expected_bpm,expected_first_downbeat
+    track1.mp3,F,minor,4A,126,1.426
+    track2.mp3,A,minor,8A,128,
 
 Relative paths resolve against the CSV's own directory, so a dataset file can
 sit next to the audio. ``expected_camelot`` is optional -- it is derived from
@@ -46,6 +46,18 @@ Metrics reported, and why each one:
     Counts a half- or double-time reading as correct. The difference between
     this and the strict figure is how often the engine picked the wrong
     metrical level rather than the wrong tempo.
+
+*downbeat phase*
+    Whether the detected bar lines land on the labelled first downbeat, within
+    half a beat. This is the metric that catches a grid which is perfectly
+    spaced and one beat out of phase -- invisible in every tempo figure above,
+    and ruinous for bar jumps and phrase alignment.
+
+*grid error*
+    Where no ground truth exists, a track can still be scored against the
+    constant grid its own tempo implies. ``--verify-grid`` reports the mean
+    and p95 distance from each detected beat to the nearest gridline, which
+    is the measurement the warp verifier uses and needs no labels at all.
 """
 
 from __future__ import annotations
@@ -58,6 +70,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 # Run from a source checkout without installing.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -73,6 +87,7 @@ from dj_intelligence.music.notes import (
     parse_pitch_class,
 )
 from dj_intelligence.observability import configure_logging
+from dj_intelligence.warp import grid_error_ms
 
 
 @dataclass
@@ -80,6 +95,7 @@ class Expectation:
     path: Path
     camelot: CamelotKey | None = None
     bpm: float | None = None
+    first_downbeat: float | None = None
 
 
 @dataclass
@@ -95,6 +111,13 @@ class Tally:
     mode_correct: int = 0
     relative_confusion: int = 0
     no_key_returned: int = 0
+
+    downbeat_labelled: int = 0
+    downbeat_phase_correct: int = 0
+    downbeat_errors_ms: list[float] = field(default_factory=list)
+    grid_mean_errors_ms: list[float] = field(default_factory=list)
+    grid_p95_errors_ms: list[float] = field(default_factory=list)
+    drift_counts: dict[str, int] = field(default_factory=dict)
 
     tempo_labelled: int = 0
     tempo_returned: int = 0
@@ -127,6 +150,7 @@ def read_dataset(csv_path: Path) -> list[Expectation]:
                     path=path if path.is_absolute() else (base / path),
                     camelot=_expected_camelot(row, csv_path, line_number),
                     bpm=_expected_bpm(row),
+                    first_downbeat=_expected_seconds(row, "expected_first_downbeat"),
                 )
             )
     return rows
@@ -175,11 +199,28 @@ def _expected_bpm(row: dict[str, str]) -> float | None:
     return value if value > 0 else None
 
 
+def _expected_seconds(row: dict[str, str], column: str) -> float | None:
+    raw = (row.get(column) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 def _relative_of(key: CamelotKey) -> CamelotKey:
     return key.flipped()
 
 
-def evaluate(rows: list[Expectation], pipeline: AnalysisPipeline, *, verbose: bool) -> Tally:
+def evaluate(
+    rows: list[Expectation],
+    pipeline: AnalysisPipeline,
+    *,
+    verbose: bool,
+    verify_grid: bool = False,
+) -> Tally:
     tally = Tally()
 
     for expectation in rows:
@@ -221,6 +262,31 @@ def evaluate(rows: list[Expectation], pipeline: AnalysisPipeline, *, verbose: bo
                     tally.mode_correct += 1
                 if detected == _relative_of(expectation.camelot):
                     tally.relative_confusion += 1
+
+        drift = result.rhythm.drift.classification.value
+        tally.drift_counts[drift] = tally.drift_counts.get(drift, 0) + 1
+
+        if expectation.first_downbeat is not None:
+            tally.downbeat_labelled += 1
+            downbeats = [entry.time for entry in result.rhythm.downbeats]
+            if downbeats:
+                distance = min(abs(entry - expectation.first_downbeat) for entry in downbeats)
+                tally.downbeat_errors_ms.append(distance * 1000.0)
+                # Half a beat: past that the grid is on the wrong pulse,
+                # not merely imprecise.
+                half_beat = 0.5 * 60.0 / (result.tempo.bpm or 126.0)
+                if distance <= half_beat:
+                    tally.downbeat_phase_correct += 1
+
+        if verify_grid and result.tempo.bpm and result.rhythm.grid.first_downbeat_time is not None:
+            errors = grid_error_ms(
+                result.beats,
+                target_bpm=result.tempo.bpm,
+                anchor_time=result.rhythm.grid.first_downbeat_time,
+            )
+            if errors.size:
+                tally.grid_mean_errors_ms.append(float(np.mean(errors)))
+                tally.grid_p95_errors_ms.append(float(np.percentile(errors, 95)))
 
         if expectation.bpm is not None:
             tally.tempo_labelled += 1
@@ -287,6 +353,30 @@ def report(tally: Tally) -> dict[str, Any]:
                 tally.bpm_octave_tolerant / tempo if tempo else None
             ),
         },
+        "rhythm": {
+            "downbeat_labelled": tally.downbeat_labelled,
+            "downbeat_phase_accuracy": (
+                tally.downbeat_phase_correct / tally.downbeat_labelled
+                if tally.downbeat_labelled
+                else None
+            ),
+            "downbeat_mae_ms": (
+                sum(tally.downbeat_errors_ms) / len(tally.downbeat_errors_ms)
+                if tally.downbeat_errors_ms
+                else None
+            ),
+            "drift_distribution": tally.drift_counts,
+            "grid_mean_error_ms": (
+                sum(tally.grid_mean_errors_ms) / len(tally.grid_mean_errors_ms)
+                if tally.grid_mean_errors_ms
+                else None
+            ),
+            "grid_p95_error_ms": (
+                sum(tally.grid_p95_errors_ms) / len(tally.grid_p95_errors_ms)
+                if tally.grid_p95_errors_ms
+                else None
+            ),
+        },
         "performance": {
             "audio_seconds": round(tally.audio_seconds, 1),
             "processing_seconds": round(tally.processing_seconds, 2),
@@ -321,6 +411,22 @@ def report(tally: Tally) -> dict[str, Any]:
     print(f"    within 2%           {percent(tally.bpm_within_2, tempo)}")
     print(f"    within 2% (1/2, 2x) {percent(tally.bpm_octave_tolerant, tempo)}")
     print()
+    print("  RHYTHM")
+    print(f"    downbeat labelled   {tally.downbeat_labelled}")
+    print(
+        f"    downbeat phase      {percent(tally.downbeat_phase_correct, tally.downbeat_labelled)}"
+    )
+    if tally.downbeat_errors_ms:
+        downbeat_mae = sum(tally.downbeat_errors_ms) / len(tally.downbeat_errors_ms)
+        print(f"    downbeat MAE        {downbeat_mae:.1f} ms")
+    if tally.grid_mean_errors_ms:
+        grid_mean = sum(tally.grid_mean_errors_ms) / len(tally.grid_mean_errors_ms)
+        grid_p95 = sum(tally.grid_p95_errors_ms) / len(tally.grid_p95_errors_ms)
+        print(f"    grid error mean     {grid_mean:.1f} ms")
+        print(f"    grid error p95      {grid_p95:.1f} ms")
+    for label, count in sorted(tally.drift_counts.items()):
+        print(f"    drift: {label:<13} {count}")
+    print()
     print("  PERFORMANCE")
     print(f"    audio               {tally.audio_seconds / 60:.1f} min")
     print(f"    processing          {tally.processing_seconds:.1f} s")
@@ -350,6 +456,11 @@ def main() -> int:
         "--profile", default=None, help="Key profile: edma | temperley | krumhansl."
     )
     parser.add_argument("--no-segments", action="store_true", help="Skip windowed key analysis.")
+    parser.add_argument(
+        "--verify-grid",
+        action="store_true",
+        help="Score every beat against the track's own constant grid; needs no labels.",
+    )
     parser.add_argument("--json", type=Path, default=None, help="Write the summary here.")
     parser.add_argument("-v", "--verbose", action="store_true", help="One line per track.")
     args = parser.parse_args()
@@ -359,7 +470,7 @@ def main() -> int:
 
     configure_logging("WARNING", "console")
 
-    overrides: dict[str, Any] = {"log_level": "WARNING"}
+    overrides: dict[str, Any] = {"log_level": "WARNING", "profile": "full"}
     if args.engine:
         overrides["key_engine"] = args.engine
         overrides["tempo_engine"] = args.engine
@@ -380,7 +491,7 @@ def main() -> int:
     if args.verbose:
         print()
 
-    summary = report(evaluate(rows, pipeline, verbose=args.verbose))
+    summary = report(evaluate(rows, pipeline, verbose=args.verbose, verify_grid=args.verify_grid))
     summary["configuration"] = {
         "key_engine": pipeline.key_analyzer.name,
         "tempo_engine": pipeline.tempo_analyzer.name,

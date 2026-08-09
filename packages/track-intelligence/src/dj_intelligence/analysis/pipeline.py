@@ -24,26 +24,42 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import numpy as np
+
 from ..audio.decoder import DecodedAudio, FFmpegDecoder
 from ..audio.hashing import sha256_file
 from ..config import Settings, get_settings
 from ..dj.interpret import interpret
+from ..dj.warp_advice import WarpAdviceRules, recommend_warp
 from ..models import (
     AnalysisMetadata,
     AnalysisWarning,
     AudioProperties,
     KeyEstimate,
     LoudnessMeasurement,
+    PhraseGridEntry,
+    RhythmAnalysis,
     StageTiming,
+    StructureAnalysis,
     TempoEstimate,
     TonalSegment,
     TrackAnalysis,
     TrackIdentity,
     WarningCode,
+    WarpMap,
 )
 from ..observability import get_logger, stage_timer
+from ..timeline.navigation import Navigator
+from ..timeline.warp_map import WarpParameters, build_warp_map
 from ..version import package_version
-from .base import KeyAnalyzer, LoudnessAnalyzer, SegmentKeyAnalyzer, TempoAnalysis, TempoAnalyzer
+from .base import (
+    KeyAnalyzer,
+    LoudnessAnalyzer,
+    SegmentKeyAnalyzer,
+    SupportsChromagram,
+    TempoAnalysis,
+    TempoAnalyzer,
+)
 from .registry import (
     build_key_analyzer,
     build_loudness_analyzer,
@@ -51,6 +67,8 @@ from .registry import (
     build_tempo_analyzer,
     build_tonal_content_gate,
 )
+from .rhythm.stage import RhythmResult, RhythmStage
+from .structure.novelty import NoveltyStructureAnalyzer
 
 __all__ = ["AnalysisPipeline"]
 
@@ -96,9 +114,27 @@ class AnalysisPipeline:
         )
         self.tonal_content_gate = build_tonal_content_gate(self.key_analyzer, self.settings)
 
+        # Both reuse the key analyser's chromagram when it has one, so
+        # harmonic evidence for bar phase and for structure is effectively
+        # free. See DecodedAudio.features.
+        chroma_source = (
+            self.key_analyzer if isinstance(self.key_analyzer, SupportsChromagram) else None
+        )
+        self.rhythm_stage = RhythmStage(self.settings, chroma_source=chroma_source)
+        self.structure_analyzer = NoveltyStructureAnalyzer(
+            chroma_source=chroma_source,
+            min_spacing_bars=self.settings.structure_min_spacing_bars,
+        )
+
     # -- public API --------------------------------------------------------
 
-    def analyze(self, path: Path | str, *, display_name: str | None = None) -> TrackAnalysis:
+    def analyze(
+        self,
+        path: Path | str,
+        *,
+        display_name: str | None = None,
+        target_bpm: float | None = None,
+    ) -> TrackAnalysis:
         """
         Analyse one audio file.
 
@@ -168,6 +204,10 @@ class AnalysisPipeline:
         segments = self._run_segments(audio, silent or not tonal, warnings, stages)
         loudness = self._run_loudness(audio, warnings, stages)
 
+        rhythm = self._run_rhythm(audio, tempo_result, warnings, stages)
+        structure = self._run_structure(audio, rhythm, warnings, stages)
+        warp = self._run_warp(rhythm, tempo_result, warnings, stages, target_bpm=target_bpm)
+
         self._flag_confidence(key_estimate, tempo_result.estimate, warnings)
 
         dj_view = interpret(
@@ -200,8 +240,11 @@ class AnalysisPipeline:
             tonality=key_estimate,
             loudness=loudness,
             tonal_segments=segments,
-            beats=tempo_result.beats,
-            downbeats=tempo_result.downbeats,
+            beats=rhythm.beat_times or tempo_result.beats,
+            downbeats=rhythm.downbeat_times,
+            rhythm=rhythm.analysis,
+            structure=structure,
+            warp=warp,
             dj=dj_view,
             warnings=warnings,
             analysis=AnalysisMetadata(
@@ -224,6 +267,10 @@ class AnalysisPipeline:
                 "file": result.track.filename,
                 "camelot": dj_view.camelot,
                 "bpm": tempo_result.estimate.bpm,
+                "bars": rhythm.analysis.grid.bar_count,
+                "grid_confidence": rhythm.analysis.grid.confidence,
+                "drift": rhythm.analysis.drift.classification.value,
+                "warp_required": warp.recommendation.required if warp else None,
                 "key_confidence": key_estimate.confidence,
                 "tempo_confidence": tempo_result.estimate.confidence,
                 "duration_ms": round(elapsed_ms, 1),
@@ -386,6 +433,167 @@ class AnalysisPipeline:
                 )
             )
             return LoudnessMeasurement()
+
+    # -- rhythm, structure and warp ----------------------------------------
+
+    def _run_rhythm(
+        self,
+        audio: DecodedAudio,
+        tempo_result: TempoAnalysis,
+        warnings: list[AnalysisWarning],
+        stages: list[StageTiming],
+    ) -> RhythmResult:
+        """Bars, meter, local tempo and the grid. Needs beats to work from."""
+        if not self.settings.profile.includes_rhythm or len(tempo_result.beats) < 2:
+            return RhythmResult(analysis=RhythmAnalysis())
+        try:
+            with stage_timer(log, "rhythm") as fields:
+                result = self.rhythm_stage.run(audio, tempo_result.estimate, tempo_result.beats)
+                fields["bars"] = result.analysis.grid.bar_count
+                fields["beats_per_bar"] = result.analysis.meter.beats_per_bar
+                fields["grid_offset_ms"] = result.grid_offset_ms
+                fields["drift"] = result.analysis.drift.classification.value
+            stages.append(StageTiming(stage="rhythm", duration_ms=fields["duration_ms"]))
+        except Exception as exc:
+            warnings.append(
+                AnalysisWarning(
+                    code=WarningCode.RHYTHM_ANALYSIS_FAILED,
+                    message=f"{type(exc).__name__}: {exc}",
+                    stage="rhythm",
+                )
+            )
+            return RhythmResult(analysis=RhythmAnalysis())
+
+        if result.analysis.meter.beats_per_bar is None:
+            warnings.append(
+                AnalysisWarning(
+                    code=WarningCode.DOWNBEATS_UNAVAILABLE,
+                    message=(
+                        "No bar phase could be established, so bars, phrases and bar-level "
+                        "navigation are unavailable. Set DJTI_FALLBACK_BEATS_PER_BAR to "
+                        "assume a meter anyway."
+                    ),
+                    stage="rhythm",
+                )
+            )
+        return result
+
+    def _run_structure(
+        self,
+        audio: DecodedAudio,
+        rhythm: RhythmResult,
+        warnings: list[AnalysisWarning],
+        stages: list[StageTiming],
+    ) -> StructureAnalysis:
+        """Boundaries where the music changes, plus the phrase grid."""
+        if not (self.settings.profile.includes_structure and self.settings.structure_enabled):
+            return StructureAnalysis()
+        if rhythm.tempo_map is None or not rhythm.beat_times:
+            return StructureAnalysis()
+
+        boundaries = []
+        try:
+            with stage_timer(log, "structure") as fields:
+                boundaries = self.structure_analyzer.analyze(
+                    audio, np.asarray(rhythm.beat_times, dtype=np.float64), rhythm.tempo_map
+                )
+                fields["boundaries"] = len(boundaries)
+            stages.append(StageTiming(stage="structure", duration_ms=fields["duration_ms"]))
+        except Exception as exc:
+            warnings.append(
+                AnalysisWarning(
+                    code=WarningCode.STRUCTURE_ANALYSIS_FAILED,
+                    message=f"{type(exc).__name__}: {exc}",
+                    stage="structure",
+                )
+            )
+
+        # The phrase grid is arithmetic, not detection: it always exists when
+        # there are bars, and it never depends on whether novelty found
+        # anything.
+        phrase_grid = []
+        if rhythm.tempo_map.has_bars:
+            navigator = Navigator(rhythm.tempo_map, phrase_bars=self.settings.phrase_bars)
+            phrase_grid = [
+                PhraseGridEntry(
+                    index=window.index,
+                    start_bar=window.start_bar,
+                    bars=window.bars,
+                    start_time=window.start_time,
+                    end_time=window.end_time,
+                )
+                for window in navigator.phrase_grid(audio.duration_seconds)
+            ]
+
+        return StructureAnalysis(
+            boundaries=boundaries,
+            phrase_grid=phrase_grid,
+            phrase_bars=self.settings.phrase_bars if phrase_grid else None,
+        )
+
+    def _run_warp(
+        self,
+        rhythm: RhythmResult,
+        tempo_result: TempoAnalysis,
+        warnings: list[AnalysisWarning],
+        stages: list[StageTiming],
+        *,
+        target_bpm: float | None,
+    ) -> WarpMap | None:
+        """Plan a correction. Never applies one -- see ``warp.renderer``."""
+        if not self.settings.profile.includes_warp:
+            return None
+        if rhythm.tempo_map is None:
+            return None
+
+        with stage_timer(log, "warp") as fields:
+            warp_map = build_warp_map(
+                rhythm.tempo_map,
+                parameters=WarpParameters(
+                    target_bpm=target_bpm,
+                    max_grid_error_ms=self.settings.warp_max_grid_error_ms,
+                    max_marker_distance_bars=self.settings.warp_max_marker_distance_bars,
+                    min_marker_distance_beats=self.settings.warp_min_marker_distance_beats,
+                    min_safe_stretch_ratio=self.settings.warp_min_safe_stretch_ratio,
+                    max_safe_stretch_ratio=self.settings.warp_max_safe_stretch_ratio,
+                    tolerance_ms=self.settings.warp_tolerance_ms,
+                ),
+            )
+            recommendation = recommend_warp(
+                warp_map,
+                grid_confidence=rhythm.analysis.grid.confidence,
+                drift=rhythm.analysis.drift.classification,
+                tempo_reliable=tempo_result.estimate.reliable,
+                target_bpm_requested=target_bpm is not None,
+                rules=WarpAdviceRules(
+                    tolerance_ms=self.settings.warp_tolerance_ms,
+                    min_grid_confidence=self.settings.warp_min_grid_confidence,
+                    min_safe_stretch_ratio=self.settings.warp_min_safe_stretch_ratio,
+                    max_safe_stretch_ratio=self.settings.warp_max_safe_stretch_ratio,
+                ),
+            )
+            warp_map = warp_map.model_copy(update={"recommendation": recommendation})
+            fields["markers"] = warp_map.metrics.marker_count
+            fields["required"] = recommendation.required
+        stages.append(StageTiming(stage="warp", duration_ms=fields["duration_ms"]))
+
+        for warning in warp_map.warnings:
+            warnings.append(
+                AnalysisWarning(
+                    code=WarningCode.WARP_LARGE_STRETCH,
+                    message=(
+                        f"Correction implies a local stretch of "
+                        f"{warp_map.metrics.min_stretch_ratio:.3f}-"
+                        f"{warp_map.metrics.max_stretch_ratio:.3f}."
+                    ),
+                    stage="warp",
+                )
+                if warning == "warp_requires_large_local_stretch"
+                else AnalysisWarning(
+                    code=WarningCode.WARP_LARGE_STRETCH, message=warning, stage="warp"
+                )
+            )
+        return warp_map
 
     # -- post-conditions ---------------------------------------------------
 

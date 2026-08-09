@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..models import RhythmAnalysis, TempoEstimate, TrackIdentity, WarpMap
 from ..models.compatibility import TrackReference
 from ..version import ANALYSIS_VERSION, SCHEMA_VERSION
 
@@ -39,3 +40,18 @@ class ErrorResponse(BaseModel):
     error: str = Field(description="Stable machine-readable code, e.g. `unsupported_format`.")
     detail: str
     request_id: str | None = None
+
+
+class WarpPlanResponse(BaseModel):
+    """
+    What a warp would do, without doing it.
+
+    Deliberately a subset of the full analysis: a caller deciding whether to
+    spend two seconds rendering needs the grid and the recommendation, not the
+    key, the loudness or the tonal segments.
+    """
+
+    track: TrackIdentity
+    tempo: TempoEstimate
+    rhythm: RhythmAnalysis
+    warp: WarpMap | None = None
