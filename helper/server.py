@@ -52,7 +52,9 @@ def resolve_tool(name: str, configured: str | None = None) -> str:
 
 
 def load_config() -> dict:
-    with CONFIG_PATH.open(encoding="utf-8") as fh:
+    # utf-8-sig, not utf-8: tolerate a BOM from PowerShell or Notepad rather
+    # than dying on it.
+    with CONFIG_PATH.open(encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 
