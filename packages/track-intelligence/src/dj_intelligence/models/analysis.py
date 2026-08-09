@@ -26,6 +26,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..music.notes import Mode, canonical_key_name
 from ..version import ANALYSIS_VERSION, SCHEMA_VERSION
+from .rhythm import RhythmAnalysis
+from .structure import StructureAnalysis
+from .warp import WarpMap
 
 __all__ = [
     "AnalysisMetadata",
@@ -109,6 +112,9 @@ class WarningCode(StrEnum):
     SEGMENTATION_FAILED = "segmentation_failed"
     LOUDNESS_UNAVAILABLE = "loudness_unavailable"
     DOWNBEATS_UNAVAILABLE = "downbeats_unavailable"
+    RHYTHM_ANALYSIS_FAILED = "rhythm_analysis_failed"
+    STRUCTURE_ANALYSIS_FAILED = "structure_analysis_failed"
+    WARP_LARGE_STRETCH = "warp_requires_large_local_stretch"
     ENGINE_FALLBACK = "engine_fallback"
     ANALYSIS_TRUNCATED = "analysis_truncated"
 
@@ -381,10 +387,34 @@ class TrackAnalysis(_Model):
     tonality: KeyEstimate
     loudness: LoudnessMeasurement = Field(default_factory=LoudnessMeasurement)
     tonal_segments: list[TonalSegment] = Field(default_factory=list)
-    beats: list[float] = Field(default_factory=list, description="Beat positions in seconds.")
+    beats: list[float] = Field(
+        default_factory=list,
+        description=(
+            "Beat positions in seconds. A flat convenience view of `rhythm.beats`, "
+            "kept because it predates the rhythm block and callers depend on it."
+        ),
+    )
     downbeats: list[float] | None = Field(
         default=None,
-        description="Null: no backend in this build tracks downbeats. See the roadmap.",
+        description=(
+            "Bar-line positions in seconds, or null when no downbeat phase could be "
+            "established. A flat view of `rhythm.downbeats`."
+        ),
+    )
+    rhythm: RhythmAnalysis = Field(
+        default_factory=RhythmAnalysis,
+        description="The rhythmic timeline: indexed beats, bars, meter, local tempo, grid.",
+    )
+    structure: StructureAnalysis = Field(
+        default_factory=StructureAnalysis,
+        description="Where the track changes, and the phrase grid a DJ counts in.",
+    )
+    warp: WarpMap | None = Field(
+        default=None,
+        description=(
+            "Present only for the `warp` analysis profile. Describes a "
+            "correction; applying it is a separate, explicit step."
+        ),
     )
     dj: DJInterpretation = Field(default_factory=DJInterpretation)
     warnings: list[AnalysisWarning] = Field(default_factory=list)

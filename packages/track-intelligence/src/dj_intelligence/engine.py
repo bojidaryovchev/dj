@@ -43,6 +43,13 @@ def analyze(
     *,
     settings: Settings | None = None,
     display_name: str | None = None,
+    target_bpm: float | None = None,
 ) -> TrackAnalysis:
-    """Analyse an audio file and return the canonical result."""
-    return get_pipeline(settings).analyze(path, display_name=display_name)
+    """
+    Analyse an audio file and return the canonical result.
+
+    ``target_bpm`` only affects the warp profile, where it sets the tempo the
+    warp map aims at. It changes no measurement -- the track's own tempo is
+    still reported in ``tempo.bpm``.
+    """
+    return get_pipeline(settings).analyze(path, display_name=display_name, target_bpm=target_bpm)

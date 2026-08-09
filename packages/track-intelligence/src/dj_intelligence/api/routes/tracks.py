@@ -18,7 +18,7 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from ...config import Settings
+from ...config import AnalysisProfile, Settings
 from ...engine import analyze as run_analysis
 from ...errors import FileTooLargeError
 from ...models import TrackAnalysis
@@ -30,13 +30,20 @@ router = APIRouter(prefix="/v1/tracks", tags=["tracks"])
 log = get_logger(__name__)
 
 
-def _settings_for(base: Settings, segments: bool | None, max_seconds: float | None) -> Settings:
+def _settings_for(
+    base: Settings,
+    segments: bool | None,
+    max_seconds: float | None,
+    profile: AnalysisProfile | None = None,
+) -> Settings:
     overrides: dict[str, object] = {}
     if segments is not None:
         overrides["segments_enabled"] = segments
     if max_seconds is not None:
         overrides["max_analysis_seconds"] = max_seconds
-    return base.model_copy(update=overrides) if overrides else base
+    if profile is not None:
+        overrides["profile"] = profile
+    return base.with_overrides(**overrides) if overrides else base
 
 
 @router.post(
@@ -60,8 +67,12 @@ async def analyze_track(
     include_beats: Annotated[
         bool, Form(description="Include the beat grid. Thousands of floats on a long track.")
     ] = True,
+    profile: Annotated[
+        AnalysisProfile | None,
+        Form(description="How much of the pipeline to run: basic, full or warp."),
+    ] = None,
 ) -> TrackAnalysis:
-    settings = _settings_for(base_settings, segments, max_seconds)
+    settings = _settings_for(base_settings, segments, max_seconds, profile)
 
     # Reject on the declared length before reading a byte, when the client
     # was honest enough to declare one. The streaming limit still applies.
@@ -85,5 +96,12 @@ async def analyze_track(
         )
 
     if not include_beats:
-        return result.model_copy(update={"beats": []})
+        # Drop both views of the grid, not just the flat one -- the indexed
+        # beat list is the larger of the two.
+        return result.model_copy(
+            update={
+                "beats": [],
+                "rhythm": result.rhythm.model_copy(update={"beats": []}),
+            }
+        )
     return result

@@ -50,6 +50,24 @@ RUN ffmpeg -version > /dev/null \
     && python -c "import essentia.standard as es; es.KeyExtractor(); es.RhythmExtractor2013(method='multifeature'); print('essentia ok')" \
     && python -c "import librosa; print('librosa', librosa.__version__)"
 
+# Time stretching is only usable if ffmpeg was built against librubberband, and
+# "the filter is listed" is not the same as "the filter works". Stretch two
+# seconds of tone to four and check the output really is about four seconds, so
+# a base image that quietly drops librubberband fails here rather than at the
+# first warp request.
+#
+# "About" is not slackness: a phase vocoder returns whole analysis frames, so
+# this comes out at 3.95 s rather than 4.00. That inexactness is why the
+# renderer pins every segment to its target length instead of trusting the
+# stretcher to land on it.
+RUN ffmpeg -v error -f lavfi -i "sine=frequency=440:duration=2" \
+        -af "rubberband=tempo=0.5:pitch=1" -y /tmp/stretch-check.wav \
+    && python -c "import subprocess, sys; \
+out = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0','/tmp/stretch-check.wav'], capture_output=True, text=True).stdout; \
+d = float(out); print(f'rubberband stretched 2.00s -> {d:.2f}s'); \
+sys.exit(0 if 3.7 < d < 4.3 else 1)" \
+    && rm /tmp/stretch-check.wav
+
 # Essentia is present here, so prefer it. `auto` would too, but being
 # explicit means a broken Essentia install fails loudly instead of quietly
 # falling back to a different engine than the image promises.

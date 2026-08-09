@@ -33,7 +33,16 @@ import numpy as np
 
 from .music.notes import Mode
 
-__all__ = ["Progression", "render_click", "render_noise", "render_progression", "write_wav"]
+__all__ = [
+    "Groove",
+    "GrooveRender",
+    "Progression",
+    "render_click",
+    "render_groove",
+    "render_noise",
+    "render_progression",
+    "write_wav",
+]
 
 _A4_MIDI: Final = 69
 _A4_HZ: Final = 440.0
@@ -118,6 +127,161 @@ def _kick(length: int, sample_rate: int) -> np.ndarray:
     frequency = 120.0 * np.exp(-time * 40.0) + 45.0
     phase = 2 * np.pi * np.cumsum(frequency) / sample_rate
     return np.sin(phase) * np.exp(-time * 18.0)
+
+
+def _hat(length: int, sample_rate: int, rng: np.random.Generator) -> np.ndarray:
+    """Filtered noise burst. Off-beat percussion, to give a phase detector
+    something wrong to latch onto if it is not actually looking at bar lines."""
+    noise = rng.normal(0.0, 1.0, size=length)
+    decay = np.exp(-np.linspace(0.0, 30.0, length))
+    # Crude high pass: differencing removes the low end where the kick lives.
+    return np.diff(noise, prepend=0.0) * decay
+
+
+@dataclass(frozen=True, slots=True)
+class Groove:
+    """
+    A rhythmic fixture with a known answer, including a known beat grid.
+
+    Everything a grid algorithm can get wrong has a switch here: tempo that
+    ramps or steps, a first downbeat that is not at time zero, an intro with
+    no beats in it at all, missing kicks, and off-beat percussion that a naive
+    "every transient is a beat" detector would trip over.
+    """
+
+    tonic_pitch_class: int = 9
+    mode: Mode = Mode.MINOR
+    bpm: float = 126.0
+    bars: int = 32
+    beats_per_bar: int = 4
+
+    bpm_end: float | None = None
+    """Linear ramp to this tempo by the last beat."""
+
+    step_at_bar: int | None = None
+    step_bpm: float | None = None
+    """Sudden tempo change at the start of this bar."""
+
+    lead_in_seconds: float = 0.0
+    """Silence before the first beat, so bar 1 is not at timestamp zero."""
+
+    beatless_intro_bars: int = 0
+    """Bars of sustained chords with no drums at the start."""
+
+    drop_kick_beats: tuple[int, ...] = ()
+    """Beat indices whose kick is omitted."""
+
+    syncopated_percussion: bool = False
+    """Add off-beat hats between the beats."""
+
+    downbeat_emphasis: float = 1.7
+    """How much louder the bar-one kick is. This is the phase evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class GrooveRender:
+    """Rendered audio plus the ground truth it was built from."""
+
+    samples: np.ndarray
+    sample_rate: int
+    beat_times: np.ndarray
+    downbeat_times: np.ndarray
+    bpm_per_beat: np.ndarray
+    lead_in_seconds: float
+
+    @property
+    def duration_seconds(self) -> float:
+        return len(self.samples) / self.sample_rate
+
+    @property
+    def nominal_bpm(self) -> float:
+        return float(np.mean(self.bpm_per_beat))
+
+
+def _bpm_per_beat(groove: Groove, total_beats: int) -> np.ndarray:
+    if groove.bpm_end is not None:
+        return np.linspace(groove.bpm, groove.bpm_end, total_beats)
+    if groove.step_at_bar is not None and groove.step_bpm is not None:
+        step_beat = groove.step_at_bar * groove.beats_per_bar
+        tempos = np.full(total_beats, groove.bpm, dtype=np.float64)
+        tempos[step_beat:] = groove.step_bpm
+        return tempos
+    return np.full(total_beats, groove.bpm, dtype=np.float64)
+
+
+def render_groove(groove: Groove, sample_rate: int = 44100) -> GrooveRender:
+    """
+    Render a groove and return its exact beat grid alongside the audio.
+
+    The ground truth is returned rather than recomputed, so a test can measure
+    beat-timing error against what was actually synthesised instead of against
+    another estimate.
+    """
+    rng = np.random.default_rng(seed=1000 + groove.tonic_pitch_class)
+    total_beats = groove.bars * groove.beats_per_bar
+    tempos = _bpm_per_beat(groove, total_beats)
+    periods = 60.0 / tempos
+
+    beat_times = groove.lead_in_seconds + np.concatenate([[0.0], np.cumsum(periods[:-1])])
+    tail = float(periods[-1]) * 2.0
+    total_samples = int((float(beat_times[-1]) + tail) * sample_rate)
+    out = np.zeros(total_samples, dtype=np.float64)
+
+    progression = _MINOR_PROGRESSION if groove.mode is Mode.MINOR else _MAJOR_PROGRESSION
+    tonic_midi = 60 + groove.tonic_pitch_class
+    beatless_beats = groove.beatless_intro_bars * groove.beats_per_bar
+
+    for beat in range(total_beats):
+        bar = beat // groove.beats_per_bar
+        beat_in_bar = beat % groove.beats_per_bar
+        start = int(beat_times[beat] * sample_rate)
+        length = min(int(periods[beat] * sample_rate), total_samples - start)
+        if length <= 0:
+            continue
+
+        offset, quality = progression[bar % len(progression)]
+        root = tonic_midi + offset
+
+        # Chords land on the bar, and sustain across it.
+        if beat_in_bar == 0:
+            chord_length = min(
+                int(periods[beat] * groove.beats_per_bar * sample_rate), total_samples - start
+            )
+            for interval in _TRIAD[quality]:
+                out[start : start + chord_length] += 0.26 * _tone(
+                    root + interval, chord_length, sample_rate
+                )
+
+        in_beatless_intro = beat < beatless_beats
+        if not in_beatless_intro:
+            out[start : start + length] += 0.42 * _tone(root - 24, length, sample_rate)
+
+            if beat not in groove.drop_kick_beats:
+                kick_length = min(int(0.25 * sample_rate), total_samples - start)
+                if kick_length > 0:
+                    gain = 0.8 * (groove.downbeat_emphasis if beat_in_bar == 0 else 1.0)
+                    out[start : start + kick_length] += gain * _kick(kick_length, sample_rate)
+
+            if groove.syncopated_percussion:
+                hat_start = start + int(periods[beat] * 0.5 * sample_rate)
+                hat_length = min(int(0.06 * sample_rate), total_samples - hat_start)
+                if hat_length > 0:
+                    out[hat_start : hat_start + hat_length] += 0.22 * _hat(
+                        hat_length, sample_rate, rng
+                    )
+
+    out += rng.normal(0.0, 1e-4, size=total_samples)
+    peak = float(np.max(np.abs(out)))
+    samples = (out / peak * 0.89).astype(np.float32) if peak > 0 else out.astype(np.float32)
+
+    return GrooveRender(
+        samples=samples,
+        sample_rate=sample_rate,
+        beat_times=beat_times,
+        downbeat_times=beat_times[:: groove.beats_per_bar],
+        bpm_per_beat=tempos,
+        lead_in_seconds=groove.lead_in_seconds,
+    )
 
 
 def render_progression(spec: Progression, sample_rate: int = 44100) -> np.ndarray:

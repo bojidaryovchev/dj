@@ -18,8 +18,10 @@ import pytest
 from dj_intelligence.config import Settings
 from dj_intelligence.music.notes import Mode
 from dj_intelligence.synth import (
+    Groove,
     Progression,
     render_click,
+    render_groove,
     render_noise,
     render_progression,
     write_wav,
@@ -120,3 +122,12 @@ def _quiet_logging() -> Iterator[None]:
 
     configure_logging("ERROR", "console")
     yield
+
+
+@pytest.fixture(scope="session")
+def drifting_wav(audio_dir: Path) -> Path:
+    """125 -> 127 BPM. A grid that genuinely needs correcting."""
+    return write_wav(
+        audio_dir / "drifting.wav",
+        render_groove(Groove(bpm=125.0, bpm_end=127.0, bars=48)).samples,
+    )

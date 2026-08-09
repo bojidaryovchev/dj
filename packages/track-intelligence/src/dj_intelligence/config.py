@@ -22,7 +22,7 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["EngineChoice", "KeyProfile", "Settings", "get_settings"]
+__all__ = ["AnalysisProfile", "EngineChoice", "KeyProfile", "Settings", "get_settings"]
 
 
 class EngineChoice(StrEnum):
@@ -31,6 +31,45 @@ class EngineChoice(StrEnum):
     AUTO = "auto"
     ESSENTIA = "essentia"
     CHROMA = "chroma"
+
+
+class AnalysisProfile(StrEnum):
+    """
+    How much of the pipeline to run.
+
+    Rhythmic and structural analysis cost real time — the self-similarity
+    matrix in particular is the most expensive stage in the engine — and not
+    every caller needs them. A library import that only wants key and BPM
+    should not pay for a structural segmentation it will throw away.
+    """
+
+    BASIC = "basic"
+    """Decode, hash, tempo, key, loudness. No bars, no structure, no segments."""
+
+    FULL = "full"
+    """The default. Adds downbeats, meter, tempo curve, grid, tonal segments
+    and structural boundaries."""
+
+    WARP = "warp"
+    """Everything in `full`, plus the tempo map, the warp map and the warp
+    recommendation. Cheap on top of `full` — it is arithmetic over the grid —
+    but scoped separately because it answers a different question."""
+
+    @property
+    def includes_rhythm(self) -> bool:
+        return self is not AnalysisProfile.BASIC
+
+    @property
+    def includes_structure(self) -> bool:
+        return self is not AnalysisProfile.BASIC
+
+    @property
+    def includes_segments(self) -> bool:
+        return self is not AnalysisProfile.BASIC
+
+    @property
+    def includes_warp(self) -> bool:
+        return self is AnalysisProfile.WARP
 
 
 class KeyProfile(StrEnum):
@@ -56,6 +95,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    # -- profile -----------------------------------------------------------
+    profile: AnalysisProfile = AnalysisProfile.FULL
 
     # -- engines -----------------------------------------------------------
     key_engine: EngineChoice = EngineChoice.AUTO
@@ -112,6 +154,58 @@ class Settings(BaseSettings):
     dj_bpm_max: float = Field(default=180.0, gt=0.0)
     tempo_stability_max_cv: float = Field(default=0.04, gt=0.0)
 
+    # -- rhythm ------------------------------------------------------------
+    downbeats_enabled: bool = True
+    beat_offset_refinement: bool = True
+    """
+    Correct the beat grid's systematic phase error.
+
+    Beat trackers report beats late — measured at +29.8 ms for librosa — because
+    the onset envelope they work from peaks after the transient. On by default
+    because a grid that is uniformly 30 ms late is wrong for cueing, for export
+    and for anything that has to line up with another deck.
+    """
+
+    tempo_curve_window_beats: int = Field(default=64, ge=8)
+    tempo_curve_hop_beats: int = Field(default=32, ge=1)
+
+    # -- structure ----------------------------------------------------------
+    structure_enabled: bool = True
+    phrase_bars: int = Field(default=8, ge=1, le=64)
+    """Bars per phrase in the deterministic phrase grid."""
+
+    structure_min_spacing_bars: int = Field(default=4, ge=1)
+    fallback_beats_per_bar: int | None = Field(
+        default=None,
+        ge=2,
+        le=16,
+        description=(
+            "Meter to assume when detection cannot establish one. Null means "
+            "make no assumption; the measurement layer never guesses, but a DJ "
+            "workflow may reasonably opt into 4/4."
+        ),
+    )
+
+    # -- warp ---------------------------------------------------------------
+    warp_max_grid_error_ms: float = Field(default=10.0, gt=0.0)
+    warp_max_marker_distance_bars: int = Field(default=32, ge=1)
+    warp_min_marker_distance_beats: int = Field(default=4, ge=1)
+    warp_tolerance_ms: float = Field(default=15.0, gt=0.0)
+    warp_min_grid_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    warp_min_safe_stretch_ratio: float = Field(default=0.9, gt=0.0, lt=1.0)
+    warp_max_safe_stretch_ratio: float = Field(default=1.1, gt=1.0)
+    warp_crossfade_ms: float = Field(default=8.0, ge=0.0, le=100.0)
+    """
+    Equal-power crossfade at segment joins in the renderer.
+
+    Adjacent segments come from the same source at slightly different stretch
+    ratios, so a butt splice can click. 8 ms is short enough not to smear a
+    transient and long enough to remove the discontinuity; there is no
+    universally correct value, which is why it is configurable.
+    """
+
+    warp_verification_threshold_ms: float = Field(default=15.0, gt=0.0)
+
     # -- loudness ----------------------------------------------------------
     loudness_enabled: bool = True
 
@@ -140,6 +234,22 @@ class Settings(BaseSettings):
             raise ValueError(f"unknown log level: {value}")
         return level
 
+    # -- derivation --------------------------------------------------------
+
+    def with_overrides(self, **overrides: Any) -> Settings:
+        """
+        A copy with some fields changed, **validated**.
+
+        Use this rather than ``model_copy(update=...)``. Pydantic's
+        ``model_copy`` deliberately skips validation, so
+        ``model_copy(update={"profile": "warp"})`` leaves a plain ``str``
+        where an ``AnalysisProfile`` belongs and the failure surfaces much
+        later as ``'str' object has no attribute 'includes_rhythm'``. Going
+        through validation coerces the value and rejects a typo at the point
+        it was made.
+        """
+        return Settings.model_validate({**self.model_dump(), **overrides})
+
     # -- determinism -------------------------------------------------------
 
     def analysis_parameters(self) -> dict[str, Any]:
@@ -150,6 +260,7 @@ class Settings(BaseSettings):
         moving the API to another port must not invalidate a library.
         """
         return {
+            "profile": self.profile.value,
             "key_engine": self.key_engine.value,
             "tempo_engine": self.tempo_engine.value,
             "key_profile": self.key_profile.value,
@@ -166,6 +277,18 @@ class Settings(BaseSettings):
             "silence_rms_dbfs": self.silence_rms_dbfs,
             "tempo_stability_max_cv": self.tempo_stability_max_cv,
             "loudness_enabled": self.loudness_enabled,
+            "downbeats_enabled": self.downbeats_enabled,
+            "beat_offset_refinement": self.beat_offset_refinement,
+            "tempo_curve_window_beats": self.tempo_curve_window_beats,
+            "tempo_curve_hop_beats": self.tempo_curve_hop_beats,
+            "structure_enabled": self.structure_enabled,
+            "phrase_bars": self.phrase_bars,
+            "structure_min_spacing_bars": self.structure_min_spacing_bars,
+            "fallback_beats_per_bar": self.fallback_beats_per_bar,
+            "warp_max_grid_error_ms": self.warp_max_grid_error_ms,
+            "warp_max_marker_distance_bars": self.warp_max_marker_distance_bars,
+            "warp_min_marker_distance_beats": self.warp_min_marker_distance_beats,
+            "warp_tolerance_ms": self.warp_tolerance_ms,
         }
 
     @property

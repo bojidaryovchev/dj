@@ -2,11 +2,14 @@
 The ``dj-analyze`` command.
 
 A presentation layer and nothing more. Every number it prints comes from
-:func:`dj_intelligence.engine.analyze`, which is the same call the HTTP API
-makes -- there is no second analysis path to drift out of step.
+:func:`dj_intelligence.engine.analyze` or :func:`dj_intelligence.warp.warp_track`,
+which is what the HTTP API calls too -- there is no second analysis path to
+drift out of step. Rendering lives in :mod:`dj_intelligence.reporting`.
 
     dj-analyze track.mp3            human-readable report
     dj-analyze track.mp3 --json     the canonical document, for piping
+    dj-analyze grid track.mp3       bars, meter, drift, warp advice
+    dj-analyze warp track.mp3 --target-bpm 126 -o corrected.wav
     dj-analyze keys 4A              harmonic neighbours of a Camelot key
     dj-analyze compat 4A 126 5A 126.5
     dj-analyze engines              which backends this install can run
@@ -21,22 +24,31 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from .config import EngineChoice, KeyProfile, Settings, get_settings
+from .config import AnalysisProfile, EngineChoice, KeyProfile, Settings, get_settings
 from .errors import (
     AudioIngestError,
     BackendUnavailableError,
     DJIntelligenceError,
     ToolNotFoundError,
 )
-from .models import TrackAnalysis
 from .models.compatibility import TrackReference
 from .music.camelot import CamelotKey
 from .music.notes import InvalidKeyError
 from .observability import configure_logging
+from .reporting import (
+    ACCENT,
+    MUTED,
+    Glyph,
+    console,
+    render_analysis,
+    render_beats,
+    render_grid,
+    render_warp,
+    stderr_console,
+)
 from .version import ANALYSIS_VERSION
 
 app = typer.Typer(
@@ -45,168 +57,10 @@ app = typer.Typer(
     help="Analyse audio for DJ-relevant musical properties.",
 )
 
-_COMMANDS = {"analyze", "keys", "compat", "engines", "serve"}
+_COMMANDS = {"analyze", "grid", "warp", "keys", "compat", "engines", "serve"}
 
-console = Console()
-stderr_console = Console(stderr=True)
-
-_ACCENT = "bright_cyan"
-_MUTED = "grey62"
-
-
-def _encodable(text: str) -> bool:
-    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
-    try:
-        text.encode(encoding)
-    except (UnicodeEncodeError, LookupError):
-        return False
-    return True
-
-
-class Glyph:
-    """
-    Box-drawing characters, downgraded when the console cannot encode them.
-
-    A Windows console still defaults to cp1252, where writing U+2500 raises
-    ``UnicodeEncodeError`` and takes the whole command down. Printing a report
-    is not worth crashing over, so the decoration adapts to the terminal
-    rather than assuming UTF-8.
-    """
-
-    _RICH = _encodable("─·→—✓✗")
-
-    RULE = "─" if _RICH else "-"
-    DOT = "·" if _RICH else "*"
-    ARROW = "→" if _RICH else "->"
-    DASH = "—" if _RICH else "-"
-    RANGE = "–" if _RICH else "-"  # noqa: RUF001 -- an en dash is the right glyph for a range
-    YES = "✓" if _RICH else "+"
-    NO = "✗" if _RICH else "x"
-
-
-# --------------------------------------------------------------------------
-# rendering
-# --------------------------------------------------------------------------
-
-
-def _duration(seconds: float) -> str:
-    minutes, remainder = divmod(round(seconds), 60)
-    return f"{minutes}:{remainder:02d}"
-
-
-def _field(label: str, value: object, *, note: str | None = None) -> None:
-    console.print(Text(label, style=_MUTED))
-    body = Text(str(value))
-    if note:
-        body.append(f"  {note}", style=_MUTED)
-    console.print(body)
-    console.print()
-
-
-def _render(result: TrackAnalysis) -> None:
-    rule = Glyph.RULE * 41
-    console.print(Text(rule, style=_ACCENT))
-    console.print(Text(" DJ TRACK ANALYSIS", style=f"bold {_ACCENT}"))
-    console.print(Text(rule, style=_ACCENT))
-    console.print()
-
-    _field("File", result.track.filename)
-    _field(
-        "Duration",
-        _duration(result.audio.duration_seconds),
-        note=(
-            f"analysed {_duration(result.audio.analysed_seconds)}"
-            if result.audio.analysed_seconds < result.audio.duration_seconds - 0.5
-            else None
-        ),
-    )
-
-    tempo = result.tempo
-    if tempo.bpm is None:
-        _field("Tempo", "not determined")
-    else:
-        note = None
-        if result.dj.mix_bpm and abs(result.dj.mix_bpm - tempo.bpm) > 0.01:
-            note = f"{Glyph.ARROW} mix at {result.dj.mix_bpm:.2f} ({result.dj.mix_bpm_relation})"
-        elif tempo.stable is False:
-            note = "unstable grid"
-        _field("Tempo", f"{tempo.bpm:.2f} BPM", note=note)
-
-    if result.tonality.key is None:
-        _field("Key", "not determined")
-    else:
-        mode = result.tonality.mode.value if result.tonality.mode else ""
-        _field(
-            "Key",
-            f"{result.tonality.key} {mode}",
-            note=None if result.tonality.reliable else "low confidence",
-        )
-        _field("Camelot", result.dj.camelot or Glyph.DASH)
-
-    confidence = Table.grid(padding=(0, 2))
-    confidence.add_column(style=_MUTED)
-    confidence.add_column()
-    confidence.add_row(
-        "tonal", f"{result.tonality.confidence:.2f}  ({result.tonality.confidence_type})"
-    )
-    confidence.add_row("tempo", f"{tempo.confidence:.2f}  ({tempo.confidence_type})")
-    console.print(Text("Confidence", style=_MUTED))
-    console.print(confidence)
-    console.print()
-
-    if result.dj.compatible_keys:
-        neighbours = Table.grid(padding=(0, 2))
-        neighbours.add_column()
-        neighbours.add_column(style=_MUTED)
-        for entry in result.dj.compatible_keys:
-            neighbours.add_row(
-                entry.camelot, f"{entry.key} {entry.mode}  {Glyph.DOT}  {entry.relationship}"
-            )
-        console.print(Text("Recommended harmonic neighbours", style=_MUTED))
-        console.print(neighbours)
-        console.print()
-
-    reliable_segments = [s for s in result.dj.segments if s.reliable]
-    if len(reliable_segments) > 1:
-        segments = Table.grid(padding=(0, 2))
-        segments.add_column(style=_MUTED)
-        segments.add_column()
-        segments.add_column(style=_MUTED)
-        for segment in result.dj.segments:
-            segments.add_row(
-                f"{_duration(segment.start_seconds)}{Glyph.RANGE}{_duration(segment.end_seconds)}",
-                segment.camelot or Glyph.DASH,
-                segment.relationship_to_global or ("unclear" if not segment.reliable else ""),
-            )
-        console.print(Text("Tonal segments", style=_MUTED))
-        console.print(segments)
-        console.print()
-
-    if result.loudness.integrated_lufs is not None:
-        _field("Loudness", f"{result.loudness.integrated_lufs:.1f} LUFS integrated")
-
-    engine = result.analysis.key_engine
-    _field(
-        "Analysis engine",
-        f"{engine.name if engine else 'unknown'}  {Glyph.DOT}  v{ANALYSIS_VERSION}",
-    )
-    _field(
-        "Processing time",
-        f"{result.analysis.processing_time_ms / 1000:.2f} s",
-        note=(
-            f"{result.analysis.realtime_ratio:.4f}x real-time"
-            if result.analysis.realtime_ratio
-            else None
-        ),
-    )
-
-    if result.warnings:
-        console.print(Text("Warnings", style="yellow"))
-        for warning in result.warnings:
-            console.print(Text(f"  {warning.code}: {warning.message}", style=_MUTED))
-        console.print()
-
-    console.print(Text(rule, style=_ACCENT))
+_ACCENT = ACCENT
+_MUTED = MUTED
 
 
 # --------------------------------------------------------------------------
@@ -219,10 +73,13 @@ def _settings_from_options(
     profile: KeyProfile | None,
     segments: bool,
     max_seconds: float | None,
+    depth: AnalysisProfile | None = None,
 ) -> Settings:
     """CLI flags override the environment, without mutating global settings."""
     base = get_settings()
     overrides: dict[str, object] = {}
+    if depth is not None:
+        overrides["profile"] = depth
     if engine is not None:
         overrides["key_engine"] = engine
         overrides["tempo_engine"] = engine
@@ -232,7 +89,7 @@ def _settings_from_options(
         overrides["segments_enabled"] = False
     if max_seconds is not None:
         overrides["max_analysis_seconds"] = max_seconds
-    return base.model_copy(update=overrides) if overrides else base
+    return base.with_overrides(**overrides) if overrides else base
 
 
 @app.command()
@@ -253,12 +110,16 @@ def analyze(
     max_seconds: Annotated[
         float | None, typer.Option("--max-seconds", help="Analyse only the first N seconds.")
     ] = None,
+    analysis_profile: Annotated[
+        AnalysisProfile | None,
+        typer.Option("--depth", help="How much of the pipeline to run: basic, full or warp."),
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Log every stage to stderr.")
     ] = False,
 ) -> None:
     """Analyse one audio file."""
-    settings = _settings_from_options(engine, profile, segments, max_seconds)
+    settings = _settings_from_options(engine, profile, segments, max_seconds, analysis_profile)
     # Logs go to stderr so that `--json` output stays pipeable. Without
     # --verbose the console stays quiet unless something is wrong.
     configure_logging("DEBUG" if verbose else "WARNING", settings.log_format)
@@ -278,7 +139,131 @@ def analyze(
         # print(), not console.print(): rich would wrap and style it.
         print(result.model_dump_json(indent=2))
     else:
-        _render(result)
+        render_analysis(result)
+
+
+@app.command()
+def grid(
+    file: Annotated[Path, typer.Argument(help="Audio file to analyse.", show_default=False)],
+    as_json: Annotated[bool, typer.Option("--json", help="Emit the rhythm block as JSON.")] = False,
+    beats: Annotated[
+        bool, typer.Option("--beats", help="List every beat with its bar position.")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Show the rhythmic grid: bars, meter, tempo drift and warp advice."""
+    settings = get_settings().with_overrides(profile=AnalysisProfile.WARP)
+    configure_logging("DEBUG" if verbose else "WARNING", settings.log_format)
+
+    from .engine import analyze as run_analysis
+
+    try:
+        result = run_analysis(file, settings=settings)
+    except (AudioIngestError, ToolNotFoundError, BackendUnavailableError) as exc:
+        stderr_console.print(Text(f"error: {exc}", style="red"))
+        raise typer.Exit(code=2) from exc
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "rhythm": result.rhythm.model_dump(mode="json"),
+                    "structure": result.structure.model_dump(mode="json"),
+                    "warp": result.warp.model_dump(mode="json") if result.warp else None,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    render_grid(result)
+    if beats:
+        render_beats(result)
+
+
+@app.command()
+def warp(
+    file: Annotated[Path, typer.Argument(help="Audio file to correct.", show_default=False)],
+    target_bpm: Annotated[
+        float | None, typer.Option("--target-bpm", help="Constant tempo to warp to.")
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Where to write. Default: <name>.warped.wav"),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Render even when it is not recommended.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Plan and report; write nothing.")
+    ] = False,
+    no_verify: Annotated[
+        bool, typer.Option("--no-verify", help="Skip re-analysing the rendered file.")
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """
+    Correct a track's beat grid by time-stretching it. Pitch is preserved.
+
+    Does nothing by default when the grid is already within tolerance, because
+    stretching a well-sequenced track costs transient quality for no gain.
+    Use --force to override, or --dry-run to see the plan.
+    """
+    settings = get_settings()
+    configure_logging("DEBUG" if verbose else "WARNING", settings.log_format)
+
+    try:
+        if dry_run:
+            from .engine import analyze as run_analysis
+
+            analysis = run_analysis(
+                file,
+                settings=settings.with_overrides(profile=AnalysisProfile.WARP),
+                target_bpm=target_bpm,
+            )
+            rendered, report = False, None
+            skipped = (
+                analysis.warp.recommendation.reason if analysis.warp else "No beat grid was found."
+            )
+            skipped = f"[dry run] {skipped}"
+        else:
+            from .warp import warp_track
+
+            outcome = warp_track(
+                file,
+                output=output,
+                target_bpm=target_bpm,
+                force=force,
+                verify=not no_verify,
+                settings=settings,
+            )
+            analysis = outcome.analysis
+            rendered = outcome.rendered
+            report = outcome.report
+            skipped = outcome.skipped_reason
+    except (AudioIngestError, ToolNotFoundError, BackendUnavailableError) as exc:
+        stderr_console.print(Text(f"error: {exc}", style="red"))
+        raise typer.Exit(code=2) from exc
+    except DJIntelligenceError as exc:
+        stderr_console.print(Text(f"error: {exc}", style="red"))
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "rendered": rendered,
+                    "skipped_reason": skipped,
+                    "warp": analysis.warp.model_dump(mode="json") if analysis.warp else None,
+                    "report": report.model_dump(mode="json") if report else None,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    render_warp(analysis, rendered=rendered, report=report, skipped_reason=skipped)
 
 
 @app.command()
