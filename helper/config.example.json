@@ -9,5 +9,5 @@
   "token": "GENERATE-ME: node -e \"console.log(require('crypto').randomBytes(24).toString('hex'))\"",
   "extension_id": "kbfggmpcibfbdaeclojnppjkcccphcbo",
   "ytdlp_path": "yt-dlp",
-  "extra_args": []
+  "extra_args": ["--js-runtimes", "node"]
 }
